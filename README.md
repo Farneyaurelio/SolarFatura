@@ -12,6 +12,16 @@ Esta primeira versão pública funciona localmente com XAMPP. Não é necessári
 6. Abra `http://localhost/SolarFatura/public/` no navegador.
 7. No primeiro acesso, crie a conta de administrador. Depois, cadastre a gestora, a logo e os clientes antes de gerar faturas.
 
+### Instalação automática do leitor de PDF
+
+Para evitar a configuração manual do Poppler, abra o PowerShell na pasta do projeto e execute:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Instalar-Poppler.ps1
+```
+
+O script pede confirmação, baixa a última release do Poppler para Windows, instala os arquivos em uma pasta local do usuário e configura `SOLARFATURA_PDFTOTEXT`. Ao final, feche e abra o XAMPP novamente e reinicie o Apache.
+
 ### Dados e cópias de segurança
 
 Os dados ficam exclusivamente em `storage/solarfatura.sqlite`; os PDFs enviados ficam em `storage/uploads`. Para fazer backup, pare o Apache e copie a pasta `storage` para um local seguro. Esses arquivos possuem dados pessoais e **não devem ser enviados ao GitHub**.
