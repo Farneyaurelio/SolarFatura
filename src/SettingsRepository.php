@@ -38,7 +38,11 @@ final class SettingsRepository
     /** @return array<string, string> */
     public function get(): array
     {
-        return $this->db->query('SELECT * FROM company_settings WHERE id = 1')->fetch(PDO::FETCH_ASSOC);
+        $settings = $this->db->query('SELECT * FROM company_settings WHERE id = 1')->fetch(PDO::FETCH_ASSOC) ?: [];
+        if (($settings['github_repository'] ?? '') === '') {
+            $settings['github_repository'] = 'Farneyaurelio/SolarFatura';
+        }
+        return $settings;
     }
 
     /** @param array<string, string> $input */
