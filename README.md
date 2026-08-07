@@ -1,5 +1,29 @@
 # SolarFatura
 
+## Instalação em outra máquina (versão 1.0.0)
+
+Esta primeira versão pública funciona localmente com XAMPP. Não é necessário conhecer programação, mas a instalação deve ser feita por alguém com permissão para instalar programas no Windows.
+
+1. Baixe o código em [Releases](https://github.com/Farneyaurelio/SolarFatura/releases) e extraia o arquivo ZIP em uma pasta local, por exemplo `C:\SolarFatura`.
+2. Instale o [XAMPP](https://www.apachefriends.org/pt_br/index.html), abra o **XAMPP Control Panel** e inicie apenas o serviço **Apache**.
+3. Copie a pasta extraída para `C:\xampp\htdocs\SolarFatura`.
+4. Instale o Poppler para Windows e deixe o executável `pdftotext.exe` disponível no `PATH` do Windows. Alternativamente, defina a variável de ambiente `SOLARFATURA_PDFTOTEXT` com o caminho completo do executável.
+5. No arquivo `C:\xampp\php\php.ini`, confirme que a extensão `mbstring` está habilitada e reinicie o Apache se necessário.
+6. Abra `http://localhost/SolarFatura/public/` no navegador.
+7. No primeiro acesso, crie a conta de administrador. Depois, cadastre a gestora, a logo e os clientes antes de gerar faturas.
+
+### Dados e cópias de segurança
+
+Os dados ficam exclusivamente em `storage/solarfatura.sqlite`; os PDFs enviados ficam em `storage/uploads`. Para fazer backup, pare o Apache e copie a pasta `storage` para um local seguro. Esses arquivos possuem dados pessoais e **não devem ser enviados ao GitHub**.
+
+### Atualizações
+
+No menu **Atualizações**, o sistema consulta as Releases deste repositório. Na versão atual, o download e a instalação ainda são manuais. A atualização automática será disponibilizada junto do instalador Windows, que fará cópia de segurança e verificará a integridade do pacote antes da troca de arquivos.
+
+## Licença
+
+O SolarFatura é software livre licenciado sob a [Licença MIT](LICENSE). Você pode usar, estudar, modificar e redistribuir o projeto, mantendo os avisos de licença.
+
 Gerador local de faturas para energia por compensação: envie um PDF da Cemig, confira os dados extraídos, aplique o desconto sobre os kWh compensados e gere uma fatura pronta para imprimir ou salvar em PDF.
 
 ## Desenvolvimento local
