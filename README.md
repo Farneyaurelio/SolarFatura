@@ -82,7 +82,7 @@ Na prévia da fatura, use **Salvar no histórico** para registrar a cobrança. A
 
 ## Dados da fornecedora
 
-Em **Empresa e e-mail**, preencha nome fantasia, razão social, CNPJ, endereço, contatos e chave Pix. Esses dados passam a identificar a fornecedora no cabeçalho da fatura/PDF. Nessa mesma tela, o assunto e o corpo do e-mail podem ser editados usando as variáveis listadas pelo sistema.
+Em **Empresa e e-mail**, preencha nome fantasia, razão social, CNPJ, endereço, contatos, chave Pix e cidade do Pix. Esses dados passam a identificar a fornecedora no cabeçalho da fatura/PDF. Quando há uma chave Pix cadastrada, a fatura inclui um QR Code Pix estático, já preenchido com o valor total da cobrança. A geração é local: a chave e o valor não são enviados a serviços externos. Nessa mesma tela, o assunto e o corpo do e-mail podem ser editados usando as variáveis listadas pelo sistema.
 
 ## Acesso local
 

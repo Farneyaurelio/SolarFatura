@@ -3,6 +3,9 @@
 /storage/company/*
 /storage/*.sqlite
 /tmp/*
+/vendor/phpqrcode/
+/vendor/qrcode/
+/vendor/qrcode-package/-errors.txt
 !/storage/uploads/.gitkeep
 !/storage/generated/.gitkeep
 !/storage/company/.gitkeep
