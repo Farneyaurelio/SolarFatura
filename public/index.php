@@ -35,6 +35,17 @@ function referenceLabel(string $reference): string {
 function renderTemplate(string $template, array $values): string { return strtr($template, $values); }
 function csrfToken(): string { return $_SESSION['csrf'] ??= bin2hex(random_bytes(32)); }
 function csrfValid(): bool { return hash_equals($_SESSION['csrf'] ?? '', (string) ($_POST['csrf'] ?? '')); }
+function pdfToTextExecutable(): ?string {
+    $configured = getenv('SOLARFATURA_PDFTOTEXT');
+    if ($configured && is_file($configured)) { return $configured; }
+    $installed = glob(dirname(__DIR__) . '/storage/tools/poppler-*/Library/bin/pdftotext.exe') ?: [];
+    if ($installed) { return end($installed) ?: null; }
+    $gitBundled = 'C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe';
+    if (DIRECTORY_SEPARATOR === '\\' && is_file($gitBundled)) { return $gitBundled; }
+    $pathResult = DIRECTORY_SEPARATOR === '\\' ? (string) @shell_exec('where pdftotext 2>NUL') : (string) @shell_exec('command -v pdftotext 2>/dev/null');
+    $candidate = trim(strtok($pathResult, "\r\n") ?: '');
+    return $candidate !== '' && is_file($candidate) ? $candidate : null;
+}
 function pixQrCode(string $payload): string {
     ob_start();
     \QRcode::png($payload, null, QR_ECLEVEL_M, 5, 2);
@@ -59,7 +70,7 @@ $calculation = null;
 $invoiceChart = [];
 $invoiceSaved = false;
 $autoPrint = false;
-$appVersion = '1.0.3';
+$appVersion = '1.0.4';
 $updateCheck = null;
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $customers = new CustomerRepository(dirname(__DIR__) . '/storage/solarfatura.sqlite');
@@ -68,7 +79,7 @@ $settings = new SettingsRepository(dirname(__DIR__) . '/storage/solarfatura.sqli
 $company = $settings->get();
 $updateRepository = trim((string) ($company['github_repository'] ?? '')) ?: 'Farneyaurelio/SolarFatura';
 $auth = new AuthRepository(dirname(__DIR__) . '/storage/solarfatura.sqlite');
-$page = match ($_GET['page'] ?? '') { 'customers' => 'customers', 'customer' => 'customer', 'company' => 'company', 'updates' => 'updates', 'invoice_record' => 'invoice_record', 'invoice_saved' => 'invoice_saved', default => 'upload' };
+$page = match ($_GET['page'] ?? '') { 'customers' => 'customers', 'customer' => 'customer', 'company' => 'company', 'updates' => 'updates', 'dependencies' => 'dependencies', 'invoice_record' => 'invoice_record', 'invoice_saved' => 'invoice_saved', default => 'upload' };
 
 if (($_GET['asset'] ?? '') === 'company-logo' && !empty($company['logo_path'])) {
     $logoFile = dirname(__DIR__) . '/storage/company/' . basename($company['logo_path']);
@@ -129,7 +140,7 @@ if (!$authenticated) {
     $page = $auth->hasUsers() ? 'login' : 'setup';
 }
 $csrfOK = $method !== 'POST' || csrfValid();
-if ($authenticated && !$csrfOK && in_array($_POST['action'] ?? '', ['save_customer', 'upload', 'generate', 'save_invoice', 'update_invoice', 'mark_paid', 'delete_invoice', 'save_update_repository', 'check_updates'], true)) {
+if ($authenticated && !$csrfOK && in_array($_POST['action'] ?? '', ['save_customer', 'upload', 'generate', 'save_invoice', 'update_invoice', 'mark_paid', 'delete_invoice', 'save_update_repository', 'check_updates', 'install_poppler'], true)) {
     $error = 'Sessão expirada. Atualize a página e tente novamente.';
     $page = ($_POST['action'] ?? '') === 'save_customer' ? 'customers' : 'upload';
 }
@@ -149,6 +160,23 @@ if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') 
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'check_updates') {
     $page = 'updates';
     $updateCheck = githubLatestRelease($updateRepository);
+}
+
+if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'install_poppler') {
+    $page = 'dependencies';
+    $script = dirname(__DIR__) . '/scripts/Instalar-Poppler.ps1';
+    $installRoot = dirname(__DIR__) . '/storage/tools';
+    $log = dirname(__DIR__) . '/storage/poppler-install.log';
+    if (DIRECTORY_SEPARATOR !== '\\' || !is_file($script) || !function_exists('shell_exec')) {
+        $error = 'A instalação automática do leitor de PDF está disponível somente no Windows com PowerShell habilitado.';
+    } elseif (pdfToTextExecutable()) {
+        $_GET['poppler_ready'] = '1';
+    } else {
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File ' . escapeshellarg($script) . ' -InstallRoot ' . escapeshellarg($installRoot) . ' -NonInteractive -LogPath ' . escapeshellarg($log);
+        $launcher = 'Start-Process -FilePath powershell.exe -ArgumentList ' . escapeshellarg($arguments) . ' -WindowStyle Hidden';
+        @shell_exec('powershell.exe -NoProfile -Command ' . escapeshellarg($launcher));
+        $_GET['poppler_started'] = '1';
+    }
 }
 
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'save_company') {
@@ -230,10 +258,7 @@ if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') 
         if (!move_uploaded_file($file['tmp_name'], $target)) {
             $error = 'Não foi possível armazenar o PDF enviado.';
         } else {
-            $pdfToText = getenv('SOLARFATURA_PDFTOTEXT');
-            if (!$pdfToText && DIRECTORY_SEPARATOR === '\\' && is_file('C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe')) {
-                $pdfToText = 'C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe';
-            }
+            $pdfToText = pdfToTextExecutable();
             $command = ($pdfToText ? escapeshellarg($pdfToText) : 'pdftotext') . ' -raw ' . escapeshellarg($target) . ' - 2>&1';
             $text = (string) shell_exec($command);
             if (!str_contains($text, 'CEMIG')) {
@@ -339,10 +364,7 @@ if ($authenticated && $page === 'invoice_saved') {
     $savedPayload = $savedInvoice ? json_decode((string) $savedInvoice['payload_json'], true) : null;
     if (!$savedInvoice || !is_array($savedPayload)) {
         $sourcePath = $savedInvoice ? dirname(__DIR__) . '/storage/uploads/' . basename((string) $savedInvoice['source_file']) : '';
-        $pdfToText = getenv('SOLARFATURA_PDFTOTEXT');
-        if (!$pdfToText && DIRECTORY_SEPARATOR === '\\' && is_file('C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe')) {
-            $pdfToText = 'C:\\Program Files\\Git\\mingw64\\bin\\pdftotext.exe';
-        }
+        $pdfToText = pdfToTextExecutable();
         $sourceText = is_file($sourcePath) ? (string) shell_exec(($pdfToText ? escapeshellarg($pdfToText) : 'pdftotext') . ' -raw ' . escapeshellarg($sourcePath) . ' - 2>&1') : '';
         if (str_contains($sourceText, 'CEMIG')) {
             $data = (new CemigParser())->parse($sourceText);
@@ -423,13 +445,16 @@ if ($page === 'invoice' && $data) {
 </head>
 <body><main class="wrap">
   <a class="brand home-brand" href="./" aria-label="Ir para a página inicial do SolarFatura"><i>☀</i> SolarFatura</a><p class="tag">Fatura inteligente de energia compensada</p>
-  <?php if ($authenticated): ?><div class="account"><span>Conectado como <?= escape($_SESSION['user']['name']) ?></span><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn light">Sair</button></form></div><nav class="main-nav"><a class="btn light" href="./?page=company">Dados da Gestora</a><a class="btn light" href="./?page=customers">Clientes e unidades consumidoras</a><a class="btn light" href="./">Nova fatura</a><a class="btn light" href="./?page=updates">Atualizações</a></nav><?php endif; ?>
+  <?php if ($authenticated): ?><div class="account"><span>Conectado como <?= escape($_SESSION['user']['name']) ?></span><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn light">Sair</button></form></div><nav class="main-nav"><a class="btn light" href="./?page=company">Dados da Gestora</a><a class="btn light" href="./?page=customers">Clientes e unidades consumidoras</a><a class="btn light" href="./">Nova fatura</a><a class="btn light" href="./?page=dependencies">Dependências</a><a class="btn light" href="./?page=updates">Atualizações</a></nav><?php endif; ?>
   <?php if ($page === 'setup'): ?>
     <section class="auth"><div class="panel"><h1>Configurar acesso</h1><p>Crie a conta de administrador deste computador. Ela será necessária para acessar dados de clientes e faturas.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><form method="post"><input type="hidden" name="action" value="setup_admin"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Seu nome</span><input name="name" required autocomplete="name"></label><label><span>E-mail</span><input name="email" type="email" required autocomplete="email"></label><label><span>Senha</span><input name="password" type="password" minlength="12" required autocomplete="new-password"></label><label><span>Confirmar senha</span><input name="password_confirmation" type="password" minlength="12" required autocomplete="new-password"></label><button class="btn">Criar acesso seguro</button></form></div></section>
   <?php elseif ($page === 'login'): ?>
     <section class="auth"><div class="panel"><h1>Entrar no SolarFatura</h1><p>Use sua conta de administrador para continuar.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><form method="post"><input type="hidden" name="action" value="login"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>E-mail</span><input name="email" type="email" required autocomplete="username"></label><label><span>Senha</span><input name="password" type="password" required autocomplete="current-password"></label><button class="btn">Entrar</button></form></div></section>
   <?php elseif ($page === 'updates'): ?>
     <section class="panel customer-form"><h1>Atualizações</h1><p>Confira as versões publicadas no GitHub e mantenha o SolarFatura atualizado.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning">Repositório oficial salvo.</div><?php endif; ?><div class="grid two"><div class="card"><small>Versão instalada</small><strong>v<?= escape($appVersion) ?></strong></div><div class="card"><small>Canal de atualização</small><strong>Release estável</strong></div></div><form method="post" class="customer-form"><input type="hidden" name="action" value="save_update_repository"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Repositório oficial no GitHub</span><input name="github_repository" placeholder="usuario/SolarFatura" value="<?= escape($company['github_repository'] ?? '') ?>"></label><p class="tag">Após criar o repositório público, informe-o aqui. O sistema consulta somente a última Release estável.</p><button class="btn">Salvar repositório</button></form><?php if (!empty($company['github_repository'])): ?><form method="post" class="actions" style="justify-content:flex-start"><input type="hidden" name="action" value="check_updates"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn">Verificar atualizações</button></form><?php endif; ?><?php if ($updateCheck): ?><?php if (!empty($updateCheck['error'])): ?><div class="alert"><?= escape($updateCheck['error']) ?></div><?php else: ?><?php $hasUpdate = version_compare(ltrim((string) $updateCheck['latest'], 'vV'), $appVersion, '>'); ?><div class="warning"><strong><?= $hasUpdate ? 'Nova versão disponível: ' . escape($updateCheck['latest']) : 'Você já está na versão mais recente.' ?></strong><?php if (!empty($updateCheck['published_at'])): ?><br>Publicada em <?= escape(date('d/m/Y H:i', strtotime($updateCheck['published_at']))) ?>.<?php endif; ?><?php if (!empty($updateCheck['notes'])): ?><br><br><?= nl2br(escape($updateCheck['notes'])) ?><?php endif; ?><?php if ($hasUpdate && !empty($updateCheck['url'])): ?><p><a class="btn" target="_blank" rel="noopener" href="<?= escape($updateCheck['url']) ?>">Abrir download seguro da release</a></p><small>A instalação automática será ativada no aplicativo Windows, com backup e validação do pacote.</small><?php endif; ?></div><?php endif; ?><?php endif; ?></section>
+  <?php elseif ($page === 'dependencies'): ?>
+    <?php $popplerPath = pdfToTextExecutable(); $popplerLog = dirname(__DIR__) . '/storage/poppler-install.log'; ?>
+    <section class="panel customer-form"><h1>Dependências do sistema</h1><p>O SolarFatura já inclui os recursos necessários para gerar faturas. O único complemento usado para ler PDFs da Cemig é o leitor Poppler.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if ($popplerPath): ?><div class="warning"><strong>Leitor de PDF pronto para uso.</strong><br><small><?= escape($popplerPath) ?></small></div><?php elseif (isset($_GET['poppler_started'])): ?><div class="warning"><strong>Instalação iniciada.</strong> O Poppler está sendo baixado e configurado em segundo plano. Aguarde um instante e atualize esta página para conferir o status.</div><?php elseif (isset($_GET['poppler_ready'])): ?><div class="warning">O leitor de PDF já estava instalado e pronto para uso.</div><?php else: ?><div class="alert">Leitor de PDF não localizado. Sem ele, o sistema não consegue extrair os dados da conta Cemig.</div><form method="post"><input type="hidden" name="action" value="install_poppler"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn">Instalar leitor de PDF automaticamente</button></form><p class="tag">Ao confirmar, o SolarFatura baixa o Poppler da release oficial no GitHub e o instala somente nesta pasta do sistema.</p><?php endif; ?><?php if (!$popplerPath && is_file($popplerLog)): ?><p><small><strong>Último registro:</strong> <?= nl2br(escape(implode("\n", array_slice(file($popplerLog, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [], -4)))) ?></small></p><?php endif; ?></section>
   <?php elseif ($page === 'company'): ?>
     <section class="panel"><h1>Empresa e modelo de e-mail</h1><p>Estes dados identificam a fornecedora do serviço nas faturas e mensagens.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning">Dados da empresa e modelo de e-mail salvos.</div><?php endif; ?><form method="post" enctype="multipart/form-data" class="customer-form"><input type="hidden" name="action" value="save_company"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><h2>Dados da fornecedora</h2><div class="grid two"><label><span>Nome fantasia</span><input name="trade_name" value="<?= escape($company['trade_name']) ?>" required></label><label><span>Razão social</span><input name="legal_name" value="<?= escape($company['legal_name']) ?>"></label><label><span>CNPJ</span><input name="cnpj" value="<?= escape($company['cnpj']) ?>"></label><label><span>Telefone</span><input name="phone" value="<?= escape($company['phone']) ?>"></label><label><span>E-mail</span><input name="email" type="email" value="<?= escape($company['email']) ?>"></label><label><span>Chave Pix</span><input name="pix_key" value="<?= escape($company['pix_key']) ?>" placeholder="Ex.: +5531992510113"></label><label><span>Cidade do Pix</span><input name="pix_city" maxlength="15" value="<?= escape($company['pix_city'] ?? '') ?>" placeholder="Ex.: Belo Horizonte"></label></div><label><span>Endereço comercial</span><input name="address" value="<?= escape($company['address']) ?>"></label><p class="tag">Para telefone, informe DDD e número; o sistema adiciona +55 automaticamente. A cidade é exigida pelo padrão Pix.</p><h2>Logo da empresa</h2><?php if (!empty($company['logo_path'])): ?><p><img src="?asset=company-logo" alt="Logo atual" style="max-width:220px;max-height:90px;object-fit:contain;border:1px solid #dce8e3;border-radius:8px;padding:6px"></p><?php endif; ?><label><span>Enviar logo (PNG, JPG ou WEBP; até 2 MB)</span><input name="company_logo" type="file" accept="image/png,image/jpeg,image/webp"></label><h2>Mensagem automática de e-mail</h2><label><span>Assunto</span><input name="email_subject" value="<?= escape($company['email_subject']) ?>"></label><label><span>Corpo da mensagem</span><textarea name="email_body"><?= escape($company['email_body']) ?></textarea></label><p class="tag">Variáveis disponíveis: {{empresa}}, {{cliente}}, {{referencia}}, {{unidade_consumidora}}, {{data_envio}}, {{vencimento}}, {{valor_total}}, {{economia}}, {{economia_percentual}}.</p><p class="actions"><button class="btn">Salvar configurações</button></p></form></section>
   <?php elseif ($page === 'invoice_record' && $invoiceRecord): ?>

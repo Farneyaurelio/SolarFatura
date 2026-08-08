@@ -1,14 +1,25 @@
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SolarFatura\tools')
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SolarFatura\tools'),
+    [switch]$NonInteractive,
+    [string]$LogPath
 )
 
 $ErrorActionPreference = 'Stop'
 $apiUrl = 'https://api.github.com/repos/oschwartz10612/poppler-windows/releases/latest'
 
+function Write-InstallStatus([string]$Message) {
+    Write-Host $Message
+    if ($LogPath) {
+        $logDirectory = Split-Path -Parent $LogPath
+        if ($logDirectory) { New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null }
+        Add-Content -LiteralPath $LogPath -Value ('[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $Message)
+    }
+}
+
 Write-Host 'SolarFatura - instalação do leitor de PDFs Poppler' -ForegroundColor Green
 Write-Host 'O script baixará o pacote oficial publicado no GitHub e configurará apenas o seu usuário do Windows.'
-if ((Read-Host 'Deseja continuar? (S/N)') -notmatch '^[sS]$') {
+if (-not $NonInteractive -and (Read-Host 'Deseja continuar? (S/N)') -notmatch '^[sS]$') {
     Write-Host 'Instalação cancelada.'
     exit 0
 }
@@ -28,9 +39,9 @@ if (-not (Test-Path -LiteralPath $pdfToText)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
     $zipPath = Join-Path $env:TEMP ('SolarFatura-Poppler-' + $release.tag_name + '.zip')
     try {
-        Write-Host "Baixando Poppler $($release.tag_name)..."
+        Write-InstallStatus "Baixando Poppler $($release.tag_name)..."
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
-        Write-Host 'Extraindo arquivos...'
+        Write-InstallStatus 'Extraindo arquivos...'
         Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force
     } finally {
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
@@ -43,6 +54,8 @@ if (-not (Test-Path -LiteralPath $pdfToText)) {
 
 [Environment]::SetEnvironmentVariable('SOLARFATURA_PDFTOTEXT', $pdfToText, 'User')
 $env:SOLARFATURA_PDFTOTEXT = $pdfToText
+
+Write-InstallStatus "INSTALACAO_CONCLUIDA: $pdfToText"
 
 Write-Host 'Poppler configurado com sucesso.' -ForegroundColor Green
 Write-Host "SOLARFATURA_PDFTOTEXT = $pdfToText"
