@@ -51,6 +51,27 @@ function pixQrCode(string $payload): string {
     \QRcode::png($payload, null, QR_ECLEVEL_M, 5, 2);
     return 'data:image/png;base64,' . base64_encode((string) ob_get_clean());
 }
+/** @return array<int, array<string, mixed>> */
+function readBatchDirectory(string $folder, CustomerRepository $customers): array {
+    $files = glob($folder . DIRECTORY_SEPARATOR . '*.{pdf,PDF}', GLOB_BRACE) ?: [];
+    sort($files, SORT_NATURAL | SORT_FLAG_CASE);
+    $results = [];
+    foreach (array_slice($files, 0, 50) as $file) {
+        $entry = ['name' => basename($file), 'path' => $file, 'hash' => hash_file('sha256', $file), 'ready' => false, 'message' => ''];
+        if (filesize($file) > 12 * 1024 * 1024) { $entry['message'] = 'Arquivo maior que 12 MB.'; $results[] = $entry; continue; }
+        $reader = pdfToTextExecutable();
+        $text = (string) shell_exec(($reader ? escapeshellarg($reader) : 'pdftotext') . ' -raw ' . escapeshellarg($file) . ' - 2>&1');
+        if (!str_contains($text, 'CEMIG')) { $entry['message'] = 'Não foi possível ler uma fatura Cemig.'; $results[] = $entry; continue; }
+        $data = (new CemigParser())->parse($text);
+        $customer = !empty($data['installation_number']) ? $customers->findByInstallation((string) $data['installation_number']) : null;
+        if (!$customer) { $entry['message'] = 'UC não cadastrada no sistema.'; $entry['data'] = $data; $results[] = $entry; continue; }
+        $data['customer_id'] = $customer['id']; $data['customer_name'] = $customer['display_name']; $data['customer_address'] = $customer['address']; $data['discount_percent'] = $customer['discount_percent']; $data['bonus_amount'] = 0; $data['adjustment_amount'] = 0;
+        $entry['data'] = $data;
+        if (!empty($data['warnings'])) { $entry['message'] = implode(' ', $data['warnings']); $results[] = $entry; continue; }
+        $entry['calculation'] = (new Calculator())->calculate($data); $entry['ready'] = true; $results[] = $entry;
+    }
+    return $results;
+}
 /** @return array{latest?: string, url?: string, published_at?: string, notes?: string, error?: string} */
 function githubLatestRelease(string $repository): array {
     if (!preg_match('/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/', $repository)) { return ['error' => 'Informe o repositório no formato usuario/repositorio.']; }
@@ -79,7 +100,7 @@ $settings = new SettingsRepository(dirname(__DIR__) . '/storage/solarfatura.sqli
 $company = $settings->get();
 $updateRepository = trim((string) ($company['github_repository'] ?? '')) ?: 'Farneyaurelio/SolarFatura';
 $auth = new AuthRepository(dirname(__DIR__) . '/storage/solarfatura.sqlite');
-$page = match ($_GET['page'] ?? '') { 'customers' => 'customers', 'customer' => 'customer', 'company' => 'company', 'updates' => 'updates', 'invoice_record' => 'invoice_record', 'invoice_saved' => 'invoice_saved', default => 'upload' };
+$page = match ($_GET['page'] ?? '') { 'upload' => 'upload', 'batch' => 'batch', 'batch_preview' => 'batch_preview', 'customers' => 'customers', 'customer' => 'customer', 'customer_edit' => 'customer_edit', 'company' => 'company', 'updates' => 'updates', 'invoice_record' => 'invoice_record', 'invoice_saved' => 'invoice_saved', default => 'dashboard' };
 
 if (($_GET['asset'] ?? '') === 'company-logo' && !empty($company['logo_path'])) {
     $logoFile = dirname(__DIR__) . '/storage/company/' . basename($company['logo_path']);
@@ -140,7 +161,7 @@ if (!$authenticated) {
     $page = $auth->hasUsers() ? 'login' : 'setup';
 }
 $csrfOK = $method !== 'POST' || csrfValid();
-if ($authenticated && !$csrfOK && in_array($_POST['action'] ?? '', ['save_customer', 'upload', 'generate', 'save_invoice', 'update_invoice', 'mark_paid', 'delete_invoice', 'save_update_repository', 'check_updates', 'install_poppler'], true)) {
+if ($authenticated && !$csrfOK && in_array($_POST['action'] ?? '', ['save_customer', 'update_customer', 'delete_customer', 'upload', 'batch_scan', 'batch_save', 'generate', 'save_invoice', 'update_invoice', 'mark_paid', 'delete_invoice', 'save_update_repository', 'check_updates', 'install_poppler'], true)) {
     $error = 'Sessão expirada. Atualize a página e tente novamente.';
     $page = ($_POST['action'] ?? '') === 'save_customer' ? 'customers' : 'upload';
 }
@@ -243,6 +264,54 @@ if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') 
     }
 }
 
+if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'update_customer') {
+    $customerId = (int) ($_POST['customer_id'] ?? 0);
+    if (!$customers->findById($customerId)) {
+        $error = 'Cliente não encontrado.';
+        $page = 'customers';
+    } elseif (trim($_POST['display_name'] ?? '') === '' || trim($_POST['installation_number'] ?? '') === '') {
+        $error = 'Informe o nome de exibição e o número da unidade consumidora.';
+        $page = 'customer_edit';
+    } else {
+        try {
+            $customers->update($customerId, $_POST);
+            header('Location: ./?page=customer&id=' . $customerId . '&saved=1');
+            exit;
+        } catch (\PDOException $exception) {
+            $error = 'Já existe um cadastro para este número de unidade consumidora.';
+            $page = 'customer_edit';
+        }
+    }
+}
+
+if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'delete_customer') {
+    $customerId = (int) ($_POST['customer_id'] ?? 0);
+    if ($customers->findById($customerId)) {
+        $customers->delete($customerId);
+        header('Location: ./?page=customers&deleted=1');
+        exit;
+    }
+    $error = 'Cliente não encontrado.';
+    $page = 'customers';
+}
+
+if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'batch_scan') {
+    $folder = realpath(trim((string) ($_POST['folder_path'] ?? '')));
+    if (!$folder || !is_dir($folder)) { $error = 'Informe uma pasta local existente.'; $page = 'batch'; }
+    else { $_SESSION['batch_import'] = readBatchDirectory($folder, $customers); $page = 'batch_preview'; }
+}
+
+if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'batch_save') {
+    $items = $_SESSION['batch_import'] ?? []; $selected = array_map('intval', $_POST['items'] ?? []); $saved = 0;
+    foreach ($selected as $index) { if (empty($items[$index]['ready']) || !is_file($items[$index]['path']) || hash_file('sha256', $items[$index]['path']) !== $items[$index]['hash']) { continue; }
+        $targetDir = dirname(__DIR__) . '/storage/uploads'; if (!is_dir($targetDir)) { mkdir($targetDir, 0750, true); }
+        $data = $items[$index]['data']; $data['source_file'] = $items[$index]['hash'] . '.pdf';
+        if (!copy($items[$index]['path'], $targetDir . '/' . $data['source_file'])) { continue; }
+        $invoices->saveGenerated((int) $data['customer_id'], $data, $items[$index]['calculation']); $saved++;
+    }
+    unset($_SESSION['batch_import']); header('Location: ./?page=batch&saved=' . $saved); exit;
+}
+
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'upload') {
     $file = $_FILES['utility_bill'] ?? null;
     if (!$file || $file['error'] !== UPLOAD_ERR_OK) {
@@ -335,7 +404,7 @@ if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') 
     $page = 'invoice';
 }
 
-$dashboard = $authenticated && $page === 'upload' ? $invoices->dashboard() : null;
+$dashboard = $authenticated && $page === 'dashboard' ? $invoices->dashboard() : null;
 $profileCustomer = null;
 $profileInvoices = [];
 $profileSummary = ['pending' => 0, 'overdue' => 0, 'amount_pending' => 0.0];
@@ -345,6 +414,15 @@ if ($authenticated && $page === 'customer') {
         $profileInvoices = $invoices->forCustomer((int) $profileCustomer['id']);
         $profileSummary = $invoices->summaryForCustomer((int) $profileCustomer['id']);
     } else {
+        $page = 'customers';
+        $error = 'Cliente não encontrado.';
+    }
+}
+
+$editCustomer = null;
+if ($authenticated && $page === 'customer_edit') {
+    $editCustomer = $customers->findById((int) ($_GET['id'] ?? $_POST['customer_id'] ?? 0));
+    if (!$editCustomer) {
         $page = 'customers';
         $error = 'Cliente não encontrado.';
     }
@@ -445,7 +523,7 @@ if ($page === 'invoice' && $data) {
 </head>
 <body><main class="wrap">
   <a class="brand home-brand" href="./" aria-label="Ir para a página inicial do SolarFatura"><i>☀</i> SolarFatura</a><p class="tag">Fatura inteligente de energia compensada</p>
-  <?php if ($authenticated): ?><div class="account"><span>Conectado como <?= escape($_SESSION['user']['name']) ?></span><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn light">Sair</button></form></div><nav class="main-nav"><a class="btn light" href="./?page=company">Dados da Gestora</a><a class="btn light" href="./?page=customers">Clientes e unidades consumidoras</a><a class="btn light" href="./">Nova fatura</a><a class="btn light" href="./?page=updates">Atualizações</a></nav><?php endif; ?>
+  <?php if ($authenticated): ?><div class="account"><span>Conectado como <?= escape($_SESSION['user']['name']) ?></span><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><button class="btn light">Sair</button></form></div><nav class="main-nav"><a class="btn light" href="./">Visão geral</a><a class="btn light" href="./?page=upload">Nova fatura</a><a class="btn light" href="./?page=batch">Importar em massa</a><a class="btn light" href="./?page=company">Dados da Gestora</a><a class="btn light" href="./?page=customers">Clientes e unidades consumidoras</a><a class="btn light" href="./?page=updates">Atualizações</a></nav><?php endif; ?>
   <?php if ($page === 'setup'): ?>
     <section class="auth"><div class="panel"><h1>Configurar acesso</h1><p>Crie a conta de administrador deste computador. Ela será necessária para acessar dados de clientes e faturas.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><form method="post"><input type="hidden" name="action" value="setup_admin"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Seu nome</span><input name="name" required autocomplete="name"></label><label><span>E-mail</span><input name="email" type="email" required autocomplete="email"></label><label><span>Senha</span><input name="password" type="password" minlength="12" required autocomplete="new-password"></label><label><span>Confirmar senha</span><input name="password_confirmation" type="password" minlength="12" required autocomplete="new-password"></label><button class="btn">Criar acesso seguro</button></form></div></section>
   <?php elseif ($page === 'login'): ?>
@@ -462,25 +540,34 @@ if ($page === 'invoice' && $data) {
   <?php elseif ($page === 'invoice_record' && $invoiceRecord): ?>
     <section class="panel customer-form"><p><a class="btn light" href="./?page=customer&id=<?= (int) $invoiceRecord['customer_id'] ?>">← Voltar para o cliente</a><?php if (!empty($invoiceRecord['payload_json'])): ?> <a class="btn" href="./?page=invoice_saved&id=<?= (int) $invoiceRecord['id'] ?>&print=1">Reimprimir fatura</a><?php endif; ?></p><h1>Editar cobrança</h1><p class="tag">Atualize os dados financeiros ou o status. A exclusão remove esta cobrança do histórico.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning">Cobrança atualizada.</div><?php endif; ?><form method="post"><input type="hidden" name="action" value="update_invoice"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="invoice_id" value="<?= (int) $invoiceRecord['id'] ?>"><div class="grid two"><label><span>Mês de referência</span><input name="reference_month" value="<?= escape($invoiceRecord['reference_month']) ?>" required></label><label><span>Vencimento</span><input name="due_date" value="<?= $invoiceRecord['due_date'] ? escape(date('d/m/Y', strtotime($invoiceRecord['due_date']))) : '' ?>" required></label><label><span>Valor cobrado (R$)</span><input name="amount_due" type="number" step="0.01" value="<?= escape($invoiceRecord['amount_due']) ?>" required></label><label><span>Economia (R$)</span><input name="savings_amount" type="number" step="0.01" value="<?= escape($invoiceRecord['savings_amount']) ?>" required></label><label><span>Status</span><select name="status"><option value="pending" <?= $invoiceRecord['status'] === 'pending' ? 'selected' : '' ?>>Pendente</option><option value="paid" <?= $invoiceRecord['status'] === 'paid' ? 'selected' : '' ?>>Paga</option></select></label></div><p class="actions"><button class="btn">Salvar alterações</button></p></form><form method="post" onsubmit="return confirm('Excluir esta cobrança do histórico?');"><input type="hidden" name="action" value="delete_invoice"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="invoice_id" value="<?= (int) $invoiceRecord['id'] ?>"><input type="hidden" name="customer_id" value="<?= (int) $invoiceRecord['customer_id'] ?>"><button class="btn light">Excluir cobrança</button></form></section>
   <?php elseif ($page === 'customer' && $profileCustomer): ?>
-    <section class="panel"><p><a class="btn light" href="./?page=customers">← Voltar para clientes</a></p><h1><?= escape($profileCustomer['display_name']) ?></h1><p class="tag">Perfil da unidade consumidora <?= escape($profileCustomer['installation_number']) ?></p>
+    <section class="panel"><p><a class="btn light" href="./?page=customers">← Voltar para clientes</a> <a class="btn" href="./?page=customer_edit&id=<?= (int) $profileCustomer['id'] ?>">Editar dados</a></p><h1><?= escape($profileCustomer['display_name']) ?></h1><p class="tag">Perfil da unidade consumidora <?= escape($profileCustomer['installation_number']) ?></p>
       <div class="grid two"><div class="card"><small>Endereço da instalação</small><strong><?= escape($profileCustomer['address'] ?: 'Não informado') ?></strong></div><div class="card"><small>Contato</small><strong><?= escape($profileCustomer['phone'] ?: 'Não informado') ?></strong><small><?= escape($profileCustomer['email']) ?></small></div><div class="card"><small>Desconto comercial</small><strong><?= escape($profileCustomer['discount_percent']) ?>%</strong></div><div class="card"><small>Faturas pendentes</small><strong><?= $profileSummary['pending'] ?> · <?= money($profileSummary['amount_pending']) ?></strong></div></div>
+      <?php if (isset($_GET['saved'])): ?><div class="warning">Dados do cliente e da unidade consumidora atualizados.</div><?php endif; ?>
       <?php if ($profileSummary['overdue'] > 0): ?><div class="alert">Atenção: há <?= $profileSummary['overdue'] ?> fatura(s) vencida(s). O sistema poderá usar este indicador para alertas futuros.</div><?php else: ?><div class="warning">Sem faturas vencidas. Alertas de atraso serão incorporados a partir deste histórico.</div><?php endif; ?>
       <h2>Histórico de cobrança e pagamentos</h2><?php if (isset($_GET['paid'])): ?><div class="warning">Pagamento registrado como quitado.</div><?php endif; ?><?php if (isset($_GET['deleted'])): ?><div class="warning">Cobrança excluída do histórico.</div><?php endif; ?><table class="table"><tr><td><strong>Referência</strong></td><td><strong>Vencimento</strong></td><td><strong>Valor</strong></td><td><strong>Economia</strong></td><td><strong>Status</strong></td><td><strong>Ações</strong></td></tr><?php if (!$profileInvoices): ?><tr><td colspan="6">Ainda não há faturas geradas para esta unidade.</td></tr><?php endif; ?><?php foreach ($profileInvoices as $invoice): ?><tr><td><?= escape($invoice['reference_month']) ?></td><td><?= $invoice['due_date'] ? escape(date('d/m/Y', strtotime($invoice['due_date']))) : '—' ?></td><td><?= money($invoice['amount_due']) ?></td><td><?= money($invoice['savings_amount']) ?></td><td><?= $invoice['status'] === 'paid' ? 'Paga' : 'Pendente' ?></td><td><a class="icon-btn primary" title="Reimprimir fatura" aria-label="Reimprimir fatura" href="./?page=invoice_saved&id=<?= (int) $invoice['id'] ?>&print=1">🖨</a><?php if (!empty($invoice['payload_json'])): ?><a class="icon-btn" title="Ver fatura" aria-label="Ver fatura" href="./?page=invoice_saved&id=<?= (int) $invoice['id'] ?>">◉</a><?php endif; ?><a class="icon-btn" title="Editar cobrança" aria-label="Editar cobrança" href="./?page=invoice_record&id=<?= (int) $invoice['id'] ?>">✎</a><?php if ($invoice['status'] !== 'paid'): ?><form method="post" style="display:inline"><input type="hidden" name="action" value="mark_paid"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="invoice_id" value="<?= (int) $invoice['id'] ?>"><input type="hidden" name="customer_id" value="<?= (int) $profileCustomer['id'] ?>"><button class="icon-btn primary" title="Marcar como paga" aria-label="Marcar como paga">✓</button></form><?php endif; ?></td></tr><?php endforeach; ?></table>
     </section>
+  <?php elseif ($page === 'customer_edit' && $editCustomer): ?>
+    <section class="panel customer-form"><p><a class="btn light" href="./?page=customer&id=<?= (int) $editCustomer['id'] ?>">← Voltar para o perfil</a></p><h1>Editar cliente e unidade consumidora</h1><p class="tag">As alterações serão usadas nas próximas faturas. As faturas já salvas preservam os dados originais.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><form method="post"><input type="hidden" name="action" value="update_customer"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="customer_id" value="<?= (int) $editCustomer['id'] ?>"><div class="grid two"><label><span>Nome exibido na fatura</span><input name="display_name" value="<?= escape($_POST['display_name'] ?? $editCustomer['display_name']) ?>" required></label><label><span>Número da unidade consumidora</span><input name="installation_number" value="<?= escape($_POST['installation_number'] ?? $editCustomer['installation_number']) ?>" required></label><label><span>Endereço da instalação</span><input name="address" value="<?= escape($_POST['address'] ?? $editCustomer['address']) ?>"></label><label><span>Telefone</span><input name="phone" value="<?= escape($_POST['phone'] ?? $editCustomer['phone']) ?>"></label><label><span>E-mail</span><input name="email" type="email" value="<?= escape($_POST['email'] ?? $editCustomer['email']) ?>"></label><label><span>Desconto padrão sobre kWh (%)</span><input name="discount_percent" type="number" value="<?= escape($_POST['discount_percent'] ?? $editCustomer['discount_percent']) ?>" min="0" max="100" step="0.01"></label></div><p class="actions"><button class="btn">Salvar alterações</button></p></form><hr style="border:0;border-top:1px solid #dce8e3;margin:32px 0 18px"><h2>Excluir cliente</h2><p class="tag">A exclusão também remove definitivamente todas as cobranças deste cliente do histórico local.</p><form method="post" onsubmit="return confirm('Excluir este cliente, a unidade consumidora e todas as cobranças do histórico? Esta ação não pode ser desfeita.');"><input type="hidden" name="action" value="delete_customer"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="customer_id" value="<?= (int) $editCustomer['id'] ?>"><button class="btn light">Excluir cliente e unidade</button></form></section>
   <?php elseif ($page === 'customers'): ?>
     <section class="panel"><h1>Clientes e unidades consumidoras</h1><p>Cadastre o nome que deve aparecer na fatura. A identificação é feita pelo número da UC lido no PDF Cemig.</p>
       <?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?>
-      <?php if (isset($_GET['saved'])): ?><div class="warning">Cadastro salvo. Ao importar uma conta dessa UC, este nome será usado automaticamente.</div><?php endif; ?>
+      <?php if (isset($_GET['saved'])): ?><div class="warning">Cadastro salvo. Ao importar uma conta dessa UC, este nome será usado automaticamente.</div><?php endif; ?><?php if (isset($_GET['deleted'])): ?><div class="warning">Cliente, unidade consumidora e cobranças associadas foram excluídos.</div><?php endif; ?>
       <form method="post" class="customer-form"><input type="hidden" name="action" value="save_customer"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="resume" value="<?= escape($_GET['resume'] ?? '') ?>"><div class="grid two"><label><span>Nome exibido na fatura</span><input name="display_name" value="<?= escape($_GET['name'] ?? '') ?>" placeholder="Ex.: Farney" required></label><label><span>Número da unidade consumidora</span><input name="installation_number" value="<?= escape($_GET['uc'] ?? '') ?>" placeholder="Ex.: 6.720.115.018-01" required></label><label><span>Endereço da instalação</span><input name="address" value="<?= escape($_GET['address'] ?? '') ?>" placeholder="Ex.: Floresta, Belo Horizonte"></label><label><span>Telefone</span><input name="phone"></label><label><span>E-mail</span><input name="email" type="email"></label><label><span>Desconto padrão sobre kWh (%)</span><input name="discount_percent" type="number" value="20" min="0" max="100" step="0.01"></label></div><p class="actions"><button class="btn">Salvar cliente</button></p></form>
-      <h2>Cadastros atuais</h2><table class="table"><tr><td><strong>Nome exibido</strong></td><td><strong>UC</strong></td><td><strong>Desconto</strong></td><td></td></tr><?php foreach ($customers->all() as $customer): ?><tr><td><?= escape($customer['display_name']) ?></td><td><?= escape($customer['installation_number']) ?></td><td><?= escape($customer['discount_percent']) ?>%</td><td><a class="btn light" href="./?page=customer&id=<?= (int) $customer['id'] ?>">Ver perfil</a></td></tr><?php endforeach; ?></table>
+      <h2>Cadastros atuais</h2><table class="table"><tr><td><strong>Nome exibido</strong></td><td><strong>UC</strong></td><td><strong>Desconto</strong></td><td></td></tr><?php foreach ($customers->all() as $customer): ?><tr><td><?= escape($customer['display_name']) ?></td><td><?= escape($customer['installation_number']) ?></td><td><?= escape($customer['discount_percent']) ?>%</td><td><a class="btn light" href="./?page=customer&id=<?= (int) $customer['id'] ?>">Ver perfil</a> <a class="btn light" href="./?page=customer_edit&id=<?= (int) $customer['id'] ?>">Editar</a></td></tr><?php endforeach; ?></table>
     </section>
-  <?php elseif ($page === 'upload'): ?>
+  <?php elseif ($page === 'dashboard'): ?>
     <section class="panel dashboard"><h1>Visão geral</h1><p class="tag">Acompanhe cobranças e recebimentos dos últimos 12 meses.</p><div class="summary"><div class="card"><small>Total recebido</small><strong><?= money($dashboard['received']) ?></strong><small><?= $dashboard['paid_count'] ?> cobrança(s) quitada(s)</small></div><div class="card"><small>Em aberto</small><strong><?= money($dashboard['pending']) ?></strong><small><?= $dashboard['pending_count'] ?> cobrança(s) pendente(s)</small></div><div class="card"><small>Em atraso</small><strong><?= money($dashboard['overdue']) ?></strong><small>Vencidas e ainda pendentes</small></div><div class="card"><small>Faturas registradas</small><strong><?= $dashboard['paid_count'] + $dashboard['pending_count'] ?></strong><small>Base para a gestão financeira</small></div></div><h2>Recebimentos e pendências por mês</h2><canvas id="dashboardChart" class="chart"></canvas><p class="dashboard-note"><span style="color:#19a974">■</span> Recebido &nbsp; <span style="color:#f7b955">■</span> Pendente</p></section>
     <script>const dashboardMonths=<?= json_encode($dashboard['months'], JSON_UNESCAPED_UNICODE) ?>,dashboardCanvas=document.getElementById('dashboardChart');if(dashboardCanvas){const d=dashboardCanvas.getContext('2d'),w=dashboardCanvas.clientWidth,h=dashboardCanvas.clientHeight;dashboardCanvas.width=w*devicePixelRatio;dashboardCanvas.height=h*devicePixelRatio;d.scale(devicePixelRatio,devicePixelRatio);const p={l:52,r:14,t:18,b:42},max=Math.max(...dashboardMonths.map(v=>Number(v.received)+Number(v.pending)),1),plot=h-p.t-p.b,band=(w-p.l-p.r)/dashboardMonths.length,bw=Math.min(30,band*.62),fmt=v=>new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL',maximumFractionDigits:0}).format(v);d.strokeStyle='#dce8e3';d.font='11px Arial';[0,.5,1].forEach(r=>{const y=p.t+plot*(1-r);d.beginPath();d.moveTo(p.l,y);d.lineTo(w-p.r,y);d.stroke();d.fillStyle='#668078';d.textAlign='right';d.fillText(fmt(max*r),p.l-7,y+4)});dashboardMonths.forEach((v,i)=>{const x=p.l+i*band+(band-bw)/2,base=h-p.b,received=plot*Number(v.received)/max,pending=plot*Number(v.pending)/max;d.fillStyle='#19a974';d.fillRect(x,base-received,bw,received);d.fillStyle='#f7b955';d.fillRect(x,base-received-pending,bw,pending);d.fillStyle='#668078';d.textAlign='center';d.fillText(v.label,x+bw/2,base+18)});}</script>
+  <?php elseif ($page === 'upload'): ?>
     <section class="panel"><h1>Gerar nova fatura</h1><p>Envie o PDF original da Cemig. Os dados serão extraídos e você poderá conferi-los antes de gerar.</p>
       <?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?>
       <form method="post" enctype="multipart/form-data" class="upload"><input type="hidden" name="action" value="upload"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><strong>Selecione uma fatura da Cemig</strong><input type="file" name="utility_bill" accept="application/pdf" required><button class="btn">Ler PDF e continuar</button><p class="tag">PDF de até 12 MB. O arquivo não fica acessível publicamente.</p></form>
     </section>
+  <?php elseif ($page === 'batch'): ?>
+    <section class="panel customer-form"><h1>Importar faturas em massa</h1><p>Informe a pasta local com os PDFs da Cemig. O sistema apenas lê os arquivos nesta etapa e mostra uma conferência antes de salvar qualquer cobrança.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning"><?= (int) $_GET['saved'] ?> fatura(s) salva(s) no histórico.</div><?php endif; ?><form method="post"><input type="hidden" name="action" value="batch_scan"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Endereço da pasta</span><input name="folder_path" placeholder="Ex.: C:\\Users\\farne\\Downloads\\Contas Anselmo setembro" required></label><p class="tag">São aceitos até 50 PDFs de até 12 MB cada. As UCs precisam estar cadastradas para serem salvas.</p><button class="btn">Ler contas e conferir</button></form></section>
+  <?php elseif ($page === 'batch_preview'): ?>
+    <?php $batchItems = $_SESSION['batch_import'] ?? []; $readyCount = count(array_filter($batchItems, static fn(array $item): bool => !empty($item['ready']))); ?>
+    <section class="panel"><p><a class="btn light" href="./?page=batch">← Escolher outra pasta</a></p><h1>Conferir faturas em massa</h1><p class="tag">Selecione somente as faturas que deseja salvar. Nenhuma cobrança foi gravada ainda.</p><form method="post"><input type="hidden" name="action" value="batch_save"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><table class="table"><tr><td><strong>Salvar</strong></td><td><strong>Arquivo / cliente</strong></td><td><strong>UC / referência</strong></td><td><strong>Consumo</strong></td><td><strong>Total</strong></td><td><strong>Conferência</strong></td></tr><?php foreach ($batchItems as $i => $item): ?><?php $row = $item['data'] ?? []; ?><tr><td><?php if (!empty($item['ready'])): ?><input type="checkbox" name="items[]" value="<?= $i ?>" checked aria-label="Salvar <?= escape($item['name']) ?>"><?php else: ?>—<?php endif; ?></td><td><strong><?= escape($item['name']) ?></strong><br><small><?= escape($row['customer_name'] ?? '') ?></small></td><td><?= escape($row['installation_number'] ?? '—') ?><br><small><?= escape($row['reference_month'] ?? '') ?></small></td><td><?= escape($row['consumption_kwh'] ?? '—') ?> kWh<br><small><?= escape($row['compensated_kwh'] ?? '') ?> compensados</small></td><td><?= !empty($item['calculation']) ? money($item['calculation']['amount_due']) : '—' ?></td><td><small><?= !empty($item['ready']) ? 'Pronta para salvar' : escape($item['message']) ?></small></td></tr><?php endforeach; ?></table><?php if ($readyCount): ?><p class="actions"><button class="btn">Salvar faturas selecionadas</button></p><?php else: ?><div class="alert">Nenhuma fatura está pronta para salvar. Corrija os cadastros ou confira os PDFs indicados.</div><?php endif; ?></form></section>
   <?php elseif ($page === 'review' && $data): ?>
     <section class="panel"><h1>Conferir leitura</h1><p>Revise os campos destacados. O desconto é aplicado somente sobre a energia compensada.</p>
       <?php foreach ($data['warnings'] as $warning): ?><div class="warning"><?= escape($warning) ?></div><?php endforeach; ?>
@@ -488,11 +575,11 @@ if ($page === 'invoice' && $data) {
       <form method="post"><input type="hidden" name="action" value="generate"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><input type="hidden" name="source_file" value="<?= escape($data['source_file']) ?>"><input type="hidden" name="customer_id" value="<?= escape($data['customer_id']) ?>"><input type="hidden" name="consumption_history" value='<?= escape(json_encode($data['consumption_history'], JSON_UNESCAPED_UNICODE)) ?>'><input type="hidden" name="utility_holder" value="<?= escape($data['utility_holder']) ?>">
         <div class="grid two"><label><span>Cliente exibido na fatura</span><input name="customer_name" value="<?= escape($data['customer_name']) ?>"></label><label><span>Endereço da instalação</span><input name="customer_address" value="<?= escape($data['customer_address']) ?>"></label><label><span>Unidade consumidora</span><input name="installation_number" value="<?= escape($data['installation_number']) ?>"></label><label><span>Mês de referência</span><input name="reference_month" value="<?= escape($data['reference_month']) ?>"></label><label><span>Vencimento</span><input name="due_date" value="<?= escape($data['due_date']) ?>"></label><label><span>Tipo de ligação</span><input name="connection_type" value="<?= escape($data['connection_type']) ?>"></label><label><span>Saldo de geração (kWh)</span><input name="generation_balance_kwh" value="<?= escape($data['generation_balance_kwh']) ?>"></label></div>
         <h2>Dados para cálculo</h2><div class="grid"><?= field('consumption_kwh',$data['consumption_kwh'],'Consumo total (kWh)') ?><?= field('compensated_kwh',$data['compensated_kwh'],'Energia compensada (kWh)') ?><?= field('full_energy_rate',$data['full_energy_rate'],'Tarifa cheia (R$/kWh)','0.00000001') ?><?= field('availability_amount',$data['availability_amount'],(string) $data['availability_label'].' (R$)','0.01') ?><?= field('public_lighting',$data['public_lighting'],'Iluminação pública (R$)','0.01') ?><?= field('discount_percent',$data['discount_percent'],'Desconto sobre kWh (%)','0.01') ?><?= field('bonus_amount',$data['bonus_amount'] ?? 0,'Bônus (R$)','0.01') ?><?= field('adjustment_amount',$data['adjustment_amount'] ?? 0,'Acerto anterior (R$)','0.01') ?></div>
-        <p class="actions"><a class="btn light" href="./">Cancelar</a><button class="btn">Gerar fatura</button></p>
+        <p class="actions"><a class="btn light" href="./?page=upload">Cancelar</a><button class="btn">Gerar fatura</button></p>
       </form>
     </section>
   <?php elseif ($page === 'invoice' && $data && $calculation): ?>
-    <div class="actions invoice-actions"><a class="btn light" href="./">Nova fatura</a><?php if ($invoiceSaved): ?><span class="btn light">Cobrança salva no histórico</span><?php else: ?><form method="post"><input type="hidden" name="action" value="save_invoice"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><?php foreach (['customer_id','source_file','customer_name','customer_address','reference_month','due_date','installation_number','connection_type','generation_balance_kwh','consumption_kwh','compensated_kwh','full_energy_rate','availability_amount','availability_label','public_lighting','discount_percent','bonus_amount','adjustment_amount'] as $name): ?><input type="hidden" name="<?= escape($name) ?>" value="<?= escape($data[$name] ?? '') ?>"><?php endforeach; ?><button class="btn">Salvar no histórico</button></form><?php endif; ?><button class="btn" onclick="window.print()">Imprimir / Salvar PDF</button><?php if ($emailHref): ?><a class="btn light" href="<?= escape($emailHref) ?>">Preparar e-mail (anexar PDF)</a><?php endif; ?><?php if ($whatsAppHref): ?><a class="btn light" target="_blank" rel="noopener" href="<?= escape($whatsAppHref) ?>">Abrir WhatsApp</a><?php endif; ?></div>
+    <div class="actions invoice-actions"><a class="btn light" href="./?page=upload">Nova fatura</a><?php if ($invoiceSaved): ?><span class="btn light">Cobrança salva no histórico</span><?php else: ?><form method="post"><input type="hidden" name="action" value="save_invoice"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><?php foreach (['customer_id','source_file','customer_name','customer_address','reference_month','due_date','installation_number','connection_type','generation_balance_kwh','consumption_kwh','compensated_kwh','full_energy_rate','availability_amount','availability_label','public_lighting','discount_percent','bonus_amount','adjustment_amount'] as $name): ?><input type="hidden" name="<?= escape($name) ?>" value="<?= escape($data[$name] ?? '') ?>"><?php endforeach; ?><button class="btn">Salvar no histórico</button></form><?php endif; ?><button class="btn" onclick="window.print()">Imprimir / Salvar PDF</button><?php if ($emailHref): ?><a class="btn light" href="<?= escape($emailHref) ?>">Preparar e-mail (anexar PDF)</a><?php endif; ?><?php if ($whatsAppHref): ?><a class="btn light" target="_blank" rel="noopener" href="<?= escape($whatsAppHref) ?>">Abrir WhatsApp</a><?php endif; ?></div>
     <article class="invoice"><header class="invoice-top"><div class="invoice-branding"><div class="system-mark" aria-hidden="true">☀</div><div><div class="brand">SolarFatura</div><p>Fatura inteligente de energia compensada<br><small>Versão <?= escape($appVersion) ?> (software livre)</small></p></div></div><div class="invoice-meta"><small>Referência</small><strong><?= escape($data['reference_month'] ?? '') ?></strong><small>Vencimento</small><strong><?= escape($data['due_date'] ?? '') ?></strong></div></header>
       <section class="party-grid"><section class="party-card"><h3>Gestora / fornecedora</h3><div class="manager-identity"><?php if (!empty($company['logo_path'])): ?><img class="manager-logo" src="?asset=company-logo" alt="Logo da <?= escape($company['trade_name']) ?>"><?php endif; ?><strong><?= escape($company['trade_name']) ?></strong></div><?php if (!empty($company['legal_name'])): ?><p><?= escape($company['legal_name']) ?></p><?php endif; ?><?php if (!empty($company['cnpj'])): ?><p>CNPJ: <?= escape($company['cnpj']) ?></p><?php endif; ?><?php if (!empty($company['address'])): ?><p><?= escape($company['address']) ?></p><?php endif; ?><?php if (!empty($company['phone']) || !empty($company['email'])): ?><p><?= escape($company['phone']) ?><?= !empty($company['phone']) && !empty($company['email']) ? ' · ' : '' ?><?= escape($company['email']) ?></p><?php endif; ?></section><section class="party-card"><h3>Cliente / unidade consumidora</h3><strong><?= escape($data['customer_name'] ?? '') ?></strong><?php if (!empty($data['customer_address'])): ?><p><?= escape($data['customer_address']) ?></p><?php endif; ?><p><b>UC:</b> <?= escape($data['installation_number'] ?? '') ?></p><?php if (!empty($data['connection_type'])): ?><p><?= escape($data['connection_type']) ?></p><?php endif; ?><p class="credit"><b>Saldo de geração:</b> <?= escape($data['generation_balance_kwh'] ?? '0') ?> kWh<br><small>Créditos informados pela Cemig na fatura de origem.</small></p></section></section>
       <div class="summary"><div class="card"><small>Economia nesta fatura</small><strong><?= money($calculation['savings']) ?></strong></div><div class="card"><small>Economia percentual</small><strong><?= number_format($calculation['savings_percent'],2,',','.') ?>%</strong></div><div class="card"><small>Energia compensada</small><strong><?= escape($data['compensated_kwh']) ?> kWh</strong></div><div class="card"><small>Consumo do mês</small><strong><?= escape($data['consumption_kwh']) ?> kWh</strong></div></div>

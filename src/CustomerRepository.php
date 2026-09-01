@@ -68,6 +68,45 @@ final class CustomerRepository
         ]);
     }
 
+    /** @param array<string, string> $input */
+    public function update(int $id, array $input): void
+    {
+        $statement = $this->db->prepare('UPDATE customers SET
+            display_name = :display_name,
+            installation_number = :installation_number,
+            address = :address,
+            phone = :phone,
+            email = :email,
+            discount_percent = :discount_percent,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id');
+        $statement->execute([
+            'id' => $id,
+            'display_name' => trim($input['display_name']),
+            'installation_number' => $this->normalizeInstallation($input['installation_number']),
+            'address' => trim($input['address'] ?? ''),
+            'phone' => trim($input['phone'] ?? ''),
+            'email' => trim($input['email'] ?? ''),
+            'discount_percent' => (float) ($input['discount_percent'] ?? 20),
+        ]);
+    }
+
+    /** Removes the unit and its billing history from this local database. */
+    public function delete(int $id): void
+    {
+        $this->db->beginTransaction();
+        try {
+            $statement = $this->db->prepare('DELETE FROM invoices WHERE customer_id = :id');
+            $statement->execute(['id' => $id]);
+            $statement = $this->db->prepare('DELETE FROM customers WHERE id = :id');
+            $statement->execute(['id' => $id]);
+            $this->db->commit();
+        } catch (\Throwable $exception) {
+            $this->db->rollBack();
+            throw $exception;
+        }
+    }
+
     /** @return array<int, array<string, mixed>> */
     public function all(): array
     {
