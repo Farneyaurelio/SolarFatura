@@ -1,6 +1,6 @@
 # SolarFatura
 
-## Instalação em outra máquina (versão 1.0.0)
+## Instalação em outra máquina (versão 1.1.1)
 
 Esta primeira versão pública funciona localmente com XAMPP. Não é necessário conhecer programação, mas a instalação deve ser feita por alguém com permissão para instalar programas no Windows.
 
@@ -79,6 +79,10 @@ Cada cliente possui um perfil próprio com dados de contato, desconto comercial,
 No histórico do cliente, cada cobrança pode ser aberta, editada ou excluída. Use **Marcar como paga** para registrar a quitação; o status muda para “Paga” e a cobrança deixa de compor os pendentes. As novas cobranças preservam uma prévia completa para reabertura posterior.
 
 Na prévia da fatura, use **Salvar no histórico** para registrar a cobrança. A impressão sugere o arquivo no formato `SolarFatura - Cliente - MES-ANO.pdf`; os botões de e-mail e WhatsApp preparam a mensagem para o contato cadastrado. O envio do PDF como anexo continuará manual nesta etapa; uma integração automática exigirá credenciais de um provedor de e-mail e/ou API oficial do WhatsApp.
+
+## Importação em massa e pacote de faturas
+
+Na tela **Importar em massa**, depois de conferir e salvar os itens selecionados, o SolarFatura gera um PDF de fatura individual para cada cliente processado. A confirmação do lote exibe o botão **Baixar faturas do lote (.zip)**, que baixa um único arquivo ZIP com esses PDFs. PDFs que não puderem ser gerados ficam fora do pacote e são contabilizados na mensagem de resultado.
 
 ## Dados da fornecedora
 

@@ -32,13 +32,20 @@ final class InvoiceRepository
         if (!in_array('payload_json', $columns, true)) {
             $this->db->exec('ALTER TABLE invoices ADD COLUMN payload_json TEXT');
         }
+        if (!in_array('batch_id', $columns, true)) {
+            $this->db->exec('ALTER TABLE invoices ADD COLUMN batch_id TEXT');
+        }
+        if (!in_array('generated_pdf_path', $columns, true)) {
+            $this->db->exec('ALTER TABLE invoices ADD COLUMN generated_pdf_path TEXT');
+        }
+        $this->db->exec('CREATE INDEX IF NOT EXISTS invoices_batch_id_index ON invoices(batch_id)');
     }
 
     /** @param array<string, mixed> $data @param array<string, float> $calculation */
-    public function saveGenerated(int $customerId, array $data, array $calculation): void
+    public function saveGenerated(int $customerId, array $data, array $calculation, ?string $batchId = null, ?string $generatedPdfPath = null): int
     {
-        $statement = $this->db->prepare('INSERT INTO invoices (customer_id, source_file, reference_month, due_date, amount_due, savings_amount, payload_json)
-            VALUES (:customer_id, :source_file, :reference_month, :due_date, :amount_due, :savings_amount, :payload_json)
+        $statement = $this->db->prepare('INSERT INTO invoices (customer_id, source_file, reference_month, due_date, amount_due, savings_amount, payload_json, batch_id, generated_pdf_path)
+            VALUES (:customer_id, :source_file, :reference_month, :due_date, :amount_due, :savings_amount, :payload_json, :batch_id, :generated_pdf_path)
             ON CONFLICT(source_file) DO UPDATE SET
               customer_id = excluded.customer_id,
               reference_month = excluded.reference_month,
@@ -46,6 +53,8 @@ final class InvoiceRepository
               amount_due = excluded.amount_due,
               savings_amount = excluded.savings_amount,
               payload_json = excluded.payload_json,
+              batch_id = COALESCE(excluded.batch_id, invoices.batch_id),
+              generated_pdf_path = COALESCE(excluded.generated_pdf_path, invoices.generated_pdf_path),
               updated_at = CURRENT_TIMESTAMP');
         $statement->execute([
             'customer_id' => $customerId,
@@ -55,7 +64,12 @@ final class InvoiceRepository
             'amount_due' => $calculation['amount_due'],
             'savings_amount' => $calculation['savings'],
             'payload_json' => json_encode($data, JSON_UNESCAPED_UNICODE),
+            'batch_id' => $batchId,
+            'generated_pdf_path' => $generatedPdfPath,
         ]);
+        $id = $this->db->prepare('SELECT id FROM invoices WHERE source_file = :source_file LIMIT 1');
+        $id->execute(['source_file' => (string) $data['source_file']]);
+        return (int) $id->fetchColumn();
     }
 
     /** @return array<string, mixed>|null */
@@ -118,6 +132,14 @@ final class InvoiceRepository
     {
         $statement = $this->db->prepare('SELECT * FROM invoices WHERE customer_id = :customer_id ORDER BY due_date DESC, id DESC');
         $statement->execute(['customer_id' => $customerId]);
+        return $statement->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function forBatch(string $batchId): array
+    {
+        $statement = $this->db->prepare('SELECT * FROM invoices WHERE batch_id = :batch_id AND generated_pdf_path IS NOT NULL ORDER BY id');
+        $statement->execute(['batch_id' => $batchId]);
         return $statement->fetchAll(PDO::FETCH_ASSOC);
     }
 

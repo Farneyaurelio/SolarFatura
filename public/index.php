@@ -10,6 +10,7 @@ use SolarFatura\CemigParser;
 use SolarFatura\CustomerRepository;
 use SolarFatura\AuthRepository;
 use SolarFatura\InvoiceRepository;
+use SolarFatura\InvoicePdfRenderer;
 use SolarFatura\PixPayload;
 use SolarFatura\SettingsRepository;
 
@@ -18,6 +19,7 @@ require_once __DIR__ . '/../src/Calculator.php';
 require_once __DIR__ . '/../src/CustomerRepository.php';
 require_once __DIR__ . '/../src/AuthRepository.php';
 require_once __DIR__ . '/../src/InvoiceRepository.php';
+require_once __DIR__ . '/../src/InvoicePdfRenderer.php';
 require_once __DIR__ . '/../src/PixPayload.php';
 require_once __DIR__ . '/../src/SettingsRepository.php';
 require_once __DIR__ . '/../vendor/qrcode-package/qrlib.php';
@@ -50,6 +52,13 @@ function pixQrCode(string $payload): string {
     ob_start();
     \QRcode::png($payload, null, QR_ECLEVEL_M, 5, 2);
     return 'data:image/png;base64,' . base64_encode((string) ob_get_clean());
+}
+function generatedPdfFilename(array $data, int $position): string {
+    $customer = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', (string) ($data['customer_name'] ?? 'cliente')) ?: 'cliente';
+    $customer = trim((string) preg_replace('/[^A-Za-z0-9]+/', '-', $customer), '-');
+    $reference = trim((string) preg_replace('/[^A-Za-z0-9]+/', '-', (string) ($data['reference_month'] ?? 'sem-referencia')), '-');
+    $installation = trim((string) preg_replace('/\D/', '', (string) ($data['installation_number'] ?? '')));
+    return sprintf('%02d_%s_%s_UC-%s.pdf', $position, $reference ?: 'sem-referencia', $customer ?: 'cliente', $installation ?: 'sem-uc');
 }
 /** @return array<int, array<string, mixed>> */
 function readBatchDirectory(string $folder, CustomerRepository $customers): array {
@@ -91,7 +100,7 @@ $calculation = null;
 $invoiceChart = [];
 $invoiceSaved = false;
 $autoPrint = false;
-$appVersion = '1.1.0';
+$appVersion = '1.1.1';
 $updateCheck = null;
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $customers = new CustomerRepository(dirname(__DIR__) . '/storage/solarfatura.sqlite');
@@ -164,6 +173,47 @@ $csrfOK = $method !== 'POST' || csrfValid();
 if ($authenticated && !$csrfOK && in_array($_POST['action'] ?? '', ['save_customer', 'update_customer', 'delete_customer', 'upload', 'batch_scan', 'batch_save', 'generate', 'save_invoice', 'update_invoice', 'mark_paid', 'delete_invoice', 'save_update_repository', 'check_updates', 'install_poppler'], true)) {
     $error = 'Sessão expirada. Atualize a página e tente novamente.';
     $page = ($_POST['action'] ?? '') === 'save_customer' ? 'customers' : 'upload';
+}
+
+if ($authenticated && isset($_GET['download_batch'])) {
+    $batchId = (string) $_GET['download_batch'];
+    if (!preg_match('/^[a-f0-9]{24}$/', $batchId)) {
+        $error = 'Lote de importação inválido.';
+        $page = 'batch';
+    } elseif (!class_exists(ZipArchive::class)) {
+        $error = 'A extensão ZIP do PHP não está disponível nesta instalação.';
+        $page = 'batch';
+    } else {
+        $generatedRoot = realpath(dirname(__DIR__) . '/storage/generated');
+        $records = $invoices->forBatch($batchId);
+        $archivePath = tempnam(sys_get_temp_dir(), 'solarfatura-lote-');
+        $zip = new ZipArchive();
+        $added = 0;
+        if ($generatedRoot && $archivePath && $zip->open($archivePath, ZipArchive::OVERWRITE) === true) {
+            foreach ($records as $record) {
+                $relative = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, (string) $record['generated_pdf_path']);
+                $pdfPath = realpath($generatedRoot . DIRECTORY_SEPARATOR . $relative);
+                if ($pdfPath && str_starts_with($pdfPath, $generatedRoot . DIRECTORY_SEPARATOR) && is_file($pdfPath) && $zip->addFile($pdfPath, basename($pdfPath))) {
+                    $added++;
+                }
+            }
+            $zip->close();
+        }
+        if ($added === 0 || !$archivePath || !is_file($archivePath)) {
+            if ($archivePath) { @unlink($archivePath); }
+            $error = 'Não há PDFs de faturas disponíveis para este lote.';
+            $page = 'batch';
+        } else {
+            $downloadName = 'faturas-lote-' . substr($batchId, 0, 8) . '.zip';
+            header('Content-Type: application/zip');
+            header('Content-Length: ' . filesize($archivePath));
+            header('Content-Disposition: attachment; filename="' . $downloadName . '"');
+            header('Cache-Control: private, no-store');
+            readfile($archivePath);
+            @unlink($archivePath);
+            exit;
+        }
+    }
 }
 
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'save_update_repository') {
@@ -302,14 +352,28 @@ if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') 
 }
 
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'batch_save') {
-    $items = $_SESSION['batch_import'] ?? []; $selected = array_map('intval', $_POST['items'] ?? []); $saved = 0;
-    foreach ($selected as $index) { if (empty($items[$index]['ready']) || !is_file($items[$index]['path']) || hash_file('sha256', $items[$index]['path']) !== $items[$index]['hash']) { continue; }
-        $targetDir = dirname(__DIR__) . '/storage/uploads'; if (!is_dir($targetDir)) { mkdir($targetDir, 0750, true); }
+    $items = $_SESSION['batch_import'] ?? []; $selected = array_unique(array_map('intval', $_POST['items'] ?? [])); $saved = 0; $failed = 0;
+    $batchId = bin2hex(random_bytes(12));
+    $targetDir = dirname(__DIR__) . '/storage/uploads';
+    $generatedDir = dirname(__DIR__) . '/storage/generated/' . $batchId;
+    if (!is_dir($targetDir)) { mkdir($targetDir, 0750, true); }
+    if (!is_dir($generatedDir)) { mkdir($generatedDir, 0750, true); }
+    $renderer = new InvoicePdfRenderer();
+    foreach ($selected as $index) { if (empty($items[$index]['ready']) || !is_file($items[$index]['path']) || hash_file('sha256', $items[$index]['path']) !== $items[$index]['hash']) { $failed++; continue; }
         $data = $items[$index]['data']; $data['source_file'] = $items[$index]['hash'] . '.pdf';
-        if (!copy($items[$index]['path'], $targetDir . '/' . $data['source_file'])) { continue; }
-        $invoices->saveGenerated((int) $data['customer_id'], $data, $items[$index]['calculation']); $saved++;
+        if (!copy($items[$index]['path'], $targetDir . '/' . $data['source_file'])) { $failed++; continue; }
+        $pdfName = generatedPdfFilename($data, $saved + 1);
+        $pdfPath = $generatedDir . DIRECTORY_SEPARATOR . $pdfName;
+        try {
+            if (file_put_contents($pdfPath, $renderer->render($data, $items[$index]['calculation'], $company)) === false) { $failed++; continue; }
+            $invoices->saveGenerated((int) $data['customer_id'], $data, $items[$index]['calculation'], $batchId, $batchId . '/' . $pdfName);
+            $saved++;
+        } catch (\Throwable) {
+            @unlink($pdfPath);
+            $failed++;
+        }
     }
-    unset($_SESSION['batch_import']); header('Location: ./?page=batch&saved=' . $saved); exit;
+    unset($_SESSION['batch_import']); header('Location: ./?page=batch&saved=' . $saved . '&failed=' . $failed . '&batch=' . $batchId); exit;
 }
 
 if ($authenticated && $csrfOK && $method === 'POST' && ($_POST['action'] ?? '') === 'upload') {
@@ -564,7 +628,7 @@ if ($page === 'invoice' && $data) {
       <form method="post" enctype="multipart/form-data" class="upload"><input type="hidden" name="action" value="upload"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><strong>Selecione uma fatura da Cemig</strong><input type="file" name="utility_bill" accept="application/pdf" required><button class="btn">Ler PDF e continuar</button><p class="tag">PDF de até 12 MB. O arquivo não fica acessível publicamente.</p></form>
     </section>
   <?php elseif ($page === 'batch'): ?>
-    <section class="panel customer-form"><h1>Importar faturas em massa</h1><p>Informe a pasta local com os PDFs da Cemig. O sistema apenas lê os arquivos nesta etapa e mostra uma conferência antes de salvar qualquer cobrança.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning"><?= (int) $_GET['saved'] ?> fatura(s) salva(s) no histórico.</div><?php endif; ?><form method="post"><input type="hidden" name="action" value="batch_scan"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Endereço da pasta</span><input name="folder_path" placeholder="Ex.: C:\\Users\\farne\\Downloads\\Contas Anselmo setembro" required></label><p class="tag">São aceitos até 50 PDFs de até 12 MB cada. As UCs precisam estar cadastradas para serem salvas.</p><button class="btn">Ler contas e conferir</button></form></section>
+    <section class="panel customer-form"><h1>Importar faturas em massa</h1><p>Informe a pasta local com os PDFs da Cemig. O sistema apenas lê os arquivos nesta etapa e mostra uma conferência antes de salvar qualquer cobrança.</p><?php if ($error): ?><div class="alert"><?= escape($error) ?></div><?php endif; ?><?php if (isset($_GET['saved'])): ?><div class="warning"><strong><?= (int) $_GET['saved'] ?> fatura(s) gerada(s) e salva(s).</strong><?php if ((int) ($_GET['failed'] ?? 0) > 0): ?><br><?= (int) $_GET['failed'] ?> item(ns) não puderam ser processados.<?php endif; ?><?php if ((int) $_GET['saved'] > 0 && preg_match('/^[a-f0-9]{24}$/', (string) ($_GET['batch'] ?? ''))): ?><p><a class="btn" href="./?page=batch&amp;download_batch=<?= escape($_GET['batch']) ?>">Baixar faturas do lote (.zip)</a></p><small>O arquivo contém um PDF individual para cada cliente processado neste lote.</small><?php endif; ?></div><?php endif; ?><form method="post"><input type="hidden" name="action" value="batch_scan"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><label><span>Endereço da pasta</span><input name="folder_path" placeholder="Ex.: C:\\Users\\farne\\Downloads\\Contas Anselmo setembro" required></label><p class="tag">São aceitos até 50 PDFs de até 12 MB cada. As UCs precisam estar cadastradas para serem salvas.</p><button class="btn">Ler contas e conferir</button></form></section>
   <?php elseif ($page === 'batch_preview'): ?>
     <?php $batchItems = $_SESSION['batch_import'] ?? []; $readyCount = count(array_filter($batchItems, static fn(array $item): bool => !empty($item['ready']))); ?>
     <section class="panel"><p><a class="btn light" href="./?page=batch">← Escolher outra pasta</a></p><h1>Conferir faturas em massa</h1><p class="tag">Selecione somente as faturas que deseja salvar. Nenhuma cobrança foi gravada ainda.</p><form method="post"><input type="hidden" name="action" value="batch_save"><input type="hidden" name="csrf" value="<?= csrfToken() ?>"><table class="table"><tr><td><strong>Salvar</strong></td><td><strong>Arquivo / cliente</strong></td><td><strong>UC / referência</strong></td><td><strong>Consumo</strong></td><td><strong>Total</strong></td><td><strong>Conferência</strong></td></tr><?php foreach ($batchItems as $i => $item): ?><?php $row = $item['data'] ?? []; ?><tr><td><?php if (!empty($item['ready'])): ?><input type="checkbox" name="items[]" value="<?= $i ?>" checked aria-label="Salvar <?= escape($item['name']) ?>"><?php else: ?>—<?php endif; ?></td><td><strong><?= escape($item['name']) ?></strong><br><small><?= escape($row['customer_name'] ?? '') ?></small></td><td><?= escape($row['installation_number'] ?? '—') ?><br><small><?= escape($row['reference_month'] ?? '') ?></small></td><td><?= escape($row['consumption_kwh'] ?? '—') ?> kWh<br><small><?= escape($row['compensated_kwh'] ?? '') ?> compensados</small></td><td><?= !empty($item['calculation']) ? money($item['calculation']['amount_due']) : '—' ?></td><td><small><?= !empty($item['ready']) ? 'Pronta para salvar' : escape($item['message']) ?></small></td></tr><?php endforeach; ?></table><?php if ($readyCount): ?><p class="actions"><button class="btn">Salvar faturas selecionadas</button></p><?php else: ?><div class="alert">Nenhuma fatura está pronta para salvar. Corrija os cadastros ou confira os PDFs indicados.</div><?php endif; ?></form></section>
